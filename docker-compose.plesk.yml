@@ -1,0 +1,98 @@
+# OpenReply su un VPS con Plesk: web app, worker, cron, PostgreSQL e Redis.
+# HTTPS e dominio li gestisce Plesk, che inoltra le richieste a 127.0.0.1:${OPENREPLY_PORT:-3000}.
+# L'immagine la costruisce GitHub (.github/workflows/vps-image.yml): il server la scarica
+# soltanto, senza consumare i circa 2 GB di RAM che servirebbero per costruirla.
+# Avvio:        docker compose -f docker-compose.plesk.yml pull && docker compose -f docker-compose.plesk.yml up -d
+# Aggiornamento: stessi due comandi.
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile.vps
+  image: ghcr.io/mailprofdigitale/openreply-vps:latest
+  restart: unless-stopped
+  # Tetto di memoria per non togliere RAM ai siti di Plesk (uso misurato: circa 200 MB).
+  mem_limit: 512m
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD}@postgres:5432/openreply
+    REDIS_URL: redis://redis:6379
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 64m
+    # BullMQ vuole che Redis non scarti mai le chiavi della coda.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Applica le migrazioni del database e termina. Web e worker partono solo dopo.
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["npx", "prisma", "migrate", "deploy"]
+
+  web:
+    <<: *app
+    command: ["npm", "run", "start"]
+    # Solo in locale: dall'esterno si arriva passando da Plesk.
+    ports:
+      - "127.0.0.1:${OPENREPLY_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    <<: *app
+    command: ["npm", "run", "worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Rinnovo token Instagram, follower, "prossimo reel": su Vercel li fa vercel.json, qui questo.
+  cron:
+    <<: *app
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      CRON_BASE_URL: http://web:3000
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
